@@ -1,5 +1,21 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+
+const String _model = 'gemini-3.8-flash';
+const String _prefsKey = 'gemini_api_key';
+
+// Trois accents graves, écrits en Unicode pour éviter de les taper à la main.
+const String _fence = '\u0060\u0060\u0060';
+
+final String _systemPrompt =
+    'Tu es Melcksousstrick, un assistant de programmation. '
+    'Réponds en français, de façon claire et concise. '
+    'Mets tout code dans des blocs ${_fence}langage ... $_fence. '
+    'N\'utilise pas d\'autre mise en forme markdown (pas de gras, pas de titres).';
 
 void main() {
   runApp(const MelcksousstrickApp());
@@ -31,10 +47,15 @@ class MelcksousstrickApp extends StatelessWidget {
 }
 
 class ChatMessage {
-  const ChatMessage({required this.text, required this.isUser});
+  const ChatMessage({
+    required this.text,
+    required this.isUser,
+    this.isError = false,
+  });
 
   final String text;
   final bool isUser;
+  final bool isError;
 }
 
 class CodeAssistantScreen extends StatefulWidget {
@@ -50,6 +71,13 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
   final _scrollController = ScrollController();
   final List<ChatMessage> _messages = [];
   bool _isThinking = false;
+  String _apiKey = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadKey();
+  }
 
   @override
   void dispose() {
@@ -59,9 +87,129 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
     super.dispose();
   }
 
+  Future<void> _loadKey() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() => _apiKey = prefs.getString(_prefsKey) ?? '');
+  }
+
+  Future<void> _editKey() async {
+    final keyController = TextEditingController(text: _apiKey);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101713),
+        title: const Text('Clé API Google Gemini', style: TextStyle(fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Colle ta clé gratuite (aistudio.google.com). Elle reste uniquement sur ce téléphone.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF9AA99F)),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: keyController,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                hintText: 'Ta clé API',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Annuler'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, keyController.text.trim()),
+            child: const Text('Enregistrer'),
+          ),
+        ],
+      ),
+    );
+    if (result == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefsKey, result);
+    if (!mounted) return;
+    setState(() => _apiKey = result);
+  }
+
+  Future<String> _askClaude(List<ChatMessage> history) async {
+    // Gemini veut des tours qui alternent : on fusionne les messages
+    // consécutifs du même rôle (par ex. après une erreur).
+    final contents = <Map<String, dynamic>>[];
+    for (final m in history) {
+      final role = m.isUser ? 'user' : 'model';
+      if (contents.isNotEmpty && contents.last['role'] == role) {
+        final parts = contents.last['parts'] as List;
+        parts[0]['text'] = '${parts[0]['text']}\n\n${m.text}';
+      } else {
+        contents.add({
+          'role': role,
+          'parts': [
+            {'text': m.text},
+          ],
+        });
+      }
+    }
+
+    final response = await http
+        .post(
+          Uri.parse(
+              'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent'),
+          headers: {
+            'content-type': 'application/json',
+            'x-goog-api-key': _apiKey,
+          },
+          body: jsonEncode({
+            'systemInstruction': {
+              'parts': [
+                {'text': _systemPrompt},
+              ],
+            },
+            'contents': contents,
+          }),
+        )
+        .timeout(const Duration(seconds: 90));
+
+    final data = jsonDecode(utf8.decode(response.bodyBytes));
+    if (response.statusCode != 200) {
+      final message = (data is Map && data['error'] is Map)
+          ? data['error']['message']
+          : 'Erreur ${response.statusCode}';
+      if (response.statusCode == 400 || response.statusCode == 403) {
+        throw 'Clé refusée ou requête invalide ($message). '
+            'Vérifie la clé avec l\'icône clé.';
+      }
+      if (response.statusCode == 429) {
+        throw 'Limite gratuite atteinte. Réessaie dans une minute ou demain.';
+      }
+      throw '$message';
+    }
+    final candidates = (data['candidates'] as List?) ?? [];
+    if (candidates.isEmpty) return '(réponse vide ou bloquée)';
+    final parts = (candidates[0]['content']?['parts'] as List?) ?? [];
+    final text = parts
+        .where((p) => p is Map && p['text'] is String)
+        .map((p) => p['text'] as String)
+        .join('\n');
+    return text.isEmpty ? '(réponse vide)' : text;
+  }
+
   Future<void> _send([String? suggestion]) async {
     final text = (suggestion ?? _controller.text).trim();
     if (text.isEmpty || _isThinking) return;
+
+    if (_apiKey.isEmpty) {
+      await _editKey();
+      if (_apiKey.isEmpty) return;
+    }
 
     setState(() {
       _messages.add(ChatMessage(text: text, isUser: true));
@@ -71,14 +219,20 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
     _focusNode.requestFocus();
     _scrollToBottom();
 
-    // Réponses locales de démonstration : aucun modèle d'IA n'est connecté.
-    await Future<void>.delayed(const Duration(milliseconds: 650));
+    final history = _messages.where((m) => !m.isError).toList();
+    ChatMessage reply;
+    try {
+      reply = ChatMessage(text: await _askClaude(history), isUser: false);
+    } catch (e) {
+      reply = ChatMessage(
+        text: 'Erreur : $e',
+        isUser: false,
+        isError: true,
+      );
+    }
     if (!mounted) return;
     setState(() {
-      _messages.add(ChatMessage(
-        text: DemoAssistant.respond(text),
-        isUser: false,
-      ));
+      _messages.add(reply);
       _isThinking = false;
     });
     _scrollToBottom();
@@ -123,7 +277,7 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
                       fontWeight: FontWeight.w800,
                     )),
                 SizedBox(height: 3),
-                Text('ASSISTANT DE CODE · DÉMO',
+                Text('ASSISTANT DE CODE · IA',
                     style: TextStyle(
                       color: Color(0xFF8A9B90),
                       fontSize: 9,
@@ -135,6 +289,11 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
         ),
         actions: [
           IconButton(
+            tooltip: 'Clé API',
+            onPressed: _editKey,
+            icon: const Icon(Icons.vpn_key_outlined),
+          ),
+          IconButton(
             tooltip: 'Nouvelle conversation',
             onPressed: _newConversation,
             icon: const Icon(Icons.add_comment_outlined),
@@ -144,7 +303,7 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
       ),
       body: Column(
         children: [
-          const _DemoNotice(),
+          _KeyNotice(hasKey: _apiKey.isNotEmpty, onTap: _editKey),
           Expanded(
             child: _messages.isEmpty
                 ? _WelcomeView(onSuggestionTap: _send)
@@ -168,40 +327,6 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
         ],
       ),
     );
-  }
-}
-
-// Trois accents graves, écrits en Unicode pour éviter de les taper à la main.
-const String _fence = '\u0060\u0060\u0060';
-
-class DemoAssistant {
-  static String respond(String request) {
-    final normalized = request.toLowerCase();
-    if (normalized.contains('flutter') || normalized.contains('bouton')) {
-      return 'Voici un petit exemple Flutter :\n\n'
-          '${_fence}dart\n'
-          'FilledButton(\n'
-          '  onPressed: () {\n'
-          '    debugPrint("Bonjour !");\n'
-          '  },\n'
-          '  child: const Text("Appuyer"),\n'
-          ')\n'
-          '$_fence\n\n'
-          'Ce bouton exécute une action lorsqu\'on appuie dessus. Ceci est une réponse prédéfinie de démonstration, pas une réponse générée par un modèle d\'IA.';
-    }
-    if (normalized.contains('explique') || normalized.contains('comprendre')) {
-      return '''Colle le morceau de code que tu veux comprendre et précise ce qui te pose question.
-
-Pour le moment, je fonctionne en mode démonstration : je ne peux pas analyser automatiquement du code ni contacter un modèle d'IA.''';
-    }
-    if (normalized.contains('corrige') || normalized.contains('erreur')) {
-      return '''Colle le code et le message d'erreur complet pour préparer une correction.
-
-Attention : cette version est une démo locale. Elle ne lance pas et ne vérifie pas réellement le code.''';
-    }
-    return '''J'ai bien reçu ta demande. Dans cette version de démonstration, mes réponses sont locales et prédéfinies ; aucun véritable modèle d'IA n'est connecté.
-
-Tu peux essayer : « Donne-moi un exemple Flutter » ou « Explique-moi une erreur ».''';
   }
 }
 
@@ -230,26 +355,45 @@ class _BrandMark extends StatelessWidget {
   }
 }
 
-class _DemoNotice extends StatelessWidget {
-  const _DemoNotice();
+class _KeyNotice extends StatelessWidget {
+  const _KeyNotice({required this.hasKey, required this.onTap});
+
+  final bool hasKey;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-      color: const Color(0xFF102017),
-      child: const Row(
-        children: [
-          Icon(Icons.info_outline, color: Color(0xFF8DFAB3), size: 15),
-          SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              'MODE DÉMO — aucune IA réelle n’est encore connectée.',
-              style: TextStyle(color: Color(0xFFB4D7C0), fontSize: 11),
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+        color: hasKey ? const Color(0xFF102017) : const Color(0xFF2A2210),
+        child: Row(
+          children: [
+            Icon(
+              hasKey ? Icons.check_circle_outline : Icons.vpn_key_outlined,
+              color: hasKey
+                  ? const Color(0xFF8DFAB3)
+                  : const Color(0xFFFFD27A),
+              size: 15,
             ),
-          ),
-        ],
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                hasKey
+                    ? 'IA connectée · $_model'
+                    : 'Aucune clé API : touche ici pour l\'ajouter.',
+                style: TextStyle(
+                  color: hasKey
+                      ? const Color(0xFFB4D7C0)
+                      : const Color(0xFFFFE2A8),
+                  fontSize: 11,
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -378,6 +522,7 @@ class _MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final user = message.isUser;
+    final error = message.isError;
     return Align(
       alignment: user ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -391,9 +536,11 @@ class _MessageBubble extends StatelessWidget {
             bottomLeft: user ? null : const Radius.circular(4),
           ),
           border: Border.all(
-            color: user
-                ? const Color(0xFF42F58D).withValues(alpha: .25)
-                : const Color(0xFF26362C),
+            color: error
+                ? const Color(0xFFFF6B6B).withValues(alpha: .6)
+                : user
+                    ? const Color(0xFF42F58D).withValues(alpha: .25)
+                    : const Color(0xFF26362C),
           ),
         ),
         child: _RichMessage(text: message.text),
@@ -535,7 +682,7 @@ class _ThinkingIndicator extends StatelessWidget {
                   strokeWidth: 2, color: Color(0xFF42F58D)),
             ),
             SizedBox(width: 10),
-            Text('Préparation de la réponse…',
+            Text('Réflexion en cours…',
                 style: TextStyle(color: Color(0xFF91A197), fontSize: 12)),
           ],
         ),
