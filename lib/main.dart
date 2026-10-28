@@ -6,6 +6,10 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 const String _model = 'gemini-3.8-flash';
+const String _openaiModel = 'gpt-6.1-terra';
+
+// Une clé qui commence par sk- est une clé OpenAI, sinon c'est une clé Gemini.
+bool _isOpenAiKey(String key) => key.startsWith('sk-');
 const String _prefsKey = 'gemini_api_key';
 
 // Trois accents graves, écrits en Unicode pour éviter de les taper à la main.
@@ -99,13 +103,13 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF101713),
-        title: const Text('Clé API Google Gemini', style: TextStyle(fontSize: 16)),
+        title: const Text('Clé API (Gemini ou OpenAI)', style: TextStyle(fontSize: 16)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Colle ta clé gratuite (aistudio.google.com). Elle reste uniquement sur ce téléphone.',
+              'Colle ta clé Gemini (gratuite, aistudio.google.com) ou OpenAI (sk-...). Elle reste uniquement sur ce téléphone.',
               style: TextStyle(fontSize: 12, color: Color(0xFF9AA99F)),
             ),
             const SizedBox(height: 12),
@@ -140,7 +144,50 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
     setState(() => _apiKey = result);
   }
 
+  Future<String> _askOpenAI(List<ChatMessage> history) async {
+    final response = await http
+        .post(
+          Uri.parse('https://api.openai.com/v1/chat/completions'),
+          headers: {
+            'content-type': 'application/json',
+            'authorization': 'Bearer $_apiKey',
+          },
+          body: jsonEncode({
+            'model': _openaiModel,
+            'messages': [
+              {'role': 'system', 'content': _systemPrompt},
+              for (final m in history)
+                {
+                  'role': m.isUser ? 'user' : 'assistant',
+                  'content': m.text,
+                },
+            ],
+          }),
+        )
+        .timeout(const Duration(seconds: 180));
+
+    final data = jsonDecode(utf8.decode(response.bodyBytes));
+    if (response.statusCode != 200) {
+      final message = (data is Map && data['error'] is Map)
+          ? data['error']['message']
+          : 'Erreur ${response.statusCode}';
+      if (response.statusCode == 401) {
+        throw 'Clé OpenAI invalide. Touche l\'icône clé pour la changer.';
+      }
+      if (response.statusCode == 429) {
+        throw 'OpenAI refuse : crédit épuisé ou trop de requêtes. '
+            'Vérifie ton solde sur platform.openai.com ($message)';
+      }
+      throw '$message';
+    }
+    final choices = (data['choices'] as List?) ?? [];
+    if (choices.isEmpty) return '(réponse vide)';
+    final text = choices[0]['message']?['content'];
+    return (text is String && text.isNotEmpty) ? text : '(réponse vide)';
+  }
+
   Future<String> _askClaude(List<ChatMessage> history) async {
+    if (_isOpenAiKey(_apiKey)) return _askOpenAI(history);
     // Gemini veut des tours qui alternent : on fusionne les messages
     // consécutifs du même rôle (par ex. après une erreur).
     final contents = <Map<String, dynamic>>[];
@@ -176,7 +223,7 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
             'contents': contents,
           }),
         )
-        .timeout(const Duration(seconds: 90));
+        .timeout(const Duration(seconds: 180));
 
     final data = jsonDecode(utf8.decode(response.bodyBytes));
     if (response.statusCode != 200) {
@@ -303,7 +350,11 @@ class _CodeAssistantScreenState extends State<CodeAssistantScreen> {
       ),
       body: Column(
         children: [
-          _KeyNotice(hasKey: _apiKey.isNotEmpty, onTap: _editKey),
+          _KeyNotice(
+            hasKey: _apiKey.isNotEmpty,
+            model: _isOpenAiKey(_apiKey) ? _openaiModel : _model,
+            onTap: _editKey,
+          ),
           Expanded(
             child: _messages.isEmpty
                 ? _WelcomeView(onSuggestionTap: _send)
@@ -356,9 +407,14 @@ class _BrandMark extends StatelessWidget {
 }
 
 class _KeyNotice extends StatelessWidget {
-  const _KeyNotice({required this.hasKey, required this.onTap});
+  const _KeyNotice({
+    required this.hasKey,
+    required this.model,
+    required this.onTap,
+  });
 
   final bool hasKey;
+  final String model;
   final VoidCallback onTap;
 
   @override
@@ -382,7 +438,7 @@ class _KeyNotice extends StatelessWidget {
             Expanded(
               child: Text(
                 hasKey
-                    ? 'IA connectée · $_model'
+                    ? 'IA connectée · $model'
                     : 'Aucune clé API : touche ici pour l\'ajouter.',
                 style: TextStyle(
                   color: hasKey
